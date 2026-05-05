@@ -8,7 +8,7 @@
  * @license    http://opensource.org/licenses/osl-3.0.php  Open Software License (OSL 3.0)
  */
 
-namespace Camiloo\Channelunity\Model;
+namespace Camiloo\Channelunity\Helper;
 
 use Magento\Framework\App\Helper\Context;
 use Magento\Framework\HTTP\Client\Curl;
