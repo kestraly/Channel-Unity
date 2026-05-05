@@ -240,13 +240,20 @@ class Orders extends AbstractModel
         $orderId = trim((string) $order->OrderId);
         $bFoundOrder = $this->checkOrderImportHistory((string) $order->OrderId, (int) $dataArray->SubscriptionId);
 
-        $forceRetry = isset($order->OrderFlags) && strpos((string) $order->OrderFlags, 'FORCE_RETRY') !== false;
+        $orderFlags = isset($order->OrderFlags) ? (string) $order->OrderFlags : '';
+
+        $this->helper->logInfo("Order ID {$order->OrderId} - OrderFlags received from CU: '{$orderFlags}'");
+
+        $forceRetry = stripos($orderFlags, 'FORCE_RETRY') !== false;
 
         if ($bFoundOrder && !$forceRetry) {
+            $this->helper->logInfo("Order ID {$order->OrderId} blocked by history. bFoundOrder: true, forceRetry: false");
             $str .= "<Exception>Order blocked, we already tried to create this</Exception>\n";
             $str .= "<NotImported>$orderId</NotImported>\n";
             return $str;
         }
+
+        $this->logOrderImportHistory((string) $order->OrderId, (int) $dataArray->SubscriptionId);
 
         $this->logOrderImportHistory((string) $order->OrderId, (int) $dataArray->SubscriptionId);
 
@@ -302,7 +309,7 @@ class Orders extends AbstractModel
         if ($sourceCurrency != $destCurrency) {
             $allowedCurrs = $store->getAvailableCurrencyCodes();
             if (!in_array($sourceCurrency, $allowedCurrs)) {
-                throw new LocalizedException(__("The order cannot be imported because the currency $sourceCurrency is not available"));
+                throw new \Magento\Framework\Exception\LocalizedException(__("The order cannot be imported because the currency $sourceCurrency is not available"));
             }
 
             $currency = $this->currencyFactory->create()->load($sourceCurrency);
@@ -351,10 +358,10 @@ class Orders extends AbstractModel
                 $this->helper->logInfo("doCreate: Product not found in Magento");
                 if ($this->helper->allowStubProducts()) {
                     $this->helper->logInfo("doCreate: Creating stub product now");
-                    $itemArray = [$this->createStubProduct($item, $productPrice)];
+                    $itemArray = [$this->createStubProduct($item, $productPrice, $websiteId)];
                 } else {
                     $this->helper->logInfo("doCreate: Stub products not allowed");
-                    throw new LocalizedException(__("ProductNotFound"));
+                    throw new \Magento\Framework\Exception\LocalizedException(__("ProductNotFound"));
                 }
             }
 
@@ -367,6 +374,7 @@ class Orders extends AbstractModel
                 $productParameters->setData('product', $product->getId());
                 $productParameters->setData('qty', (int) $item->Quantity);
 
+                // Bundle Product Logic Retained
                 if ($bundleSKUComponents) {
                     $this->helper->logInfo("Bundle product $skuToSearch");
                     $productsArray = [];
@@ -415,9 +423,9 @@ class Orders extends AbstractModel
                 $quoteItem = $quote->addProduct($product, $productParameters);
 
                 if (is_string($quoteItem)) {
-                    throw new LocalizedException(__($quoteItem));
+                    throw new \Magento\Framework\Exception\LocalizedException(__($quoteItem));
                 }
-                
+
                 if ($quoteItem) {
                     $quoteItem->setOriginalCustomPrice($productPrice);
                     $quoteItem->setCustomPrice($productPrice);
@@ -479,6 +487,10 @@ class Orders extends AbstractModel
         $this->registry->unregister('cu_shipping_price');
         $this->registry->register('cu_shipping_price', $shippingPrice);
 
+        // --- CRITICAL FIX: Add the VIP flag so the payment method allows the order ---
+        $this->registry->unregister('cu_order_in_progress');
+        $this->registry->register('cu_order_in_progress', true);
+
         $quote->getShippingAddress()
             ->setCollectShippingRates(true)
             ->collectShippingRates()
@@ -506,12 +518,27 @@ class Orders extends AbstractModel
 
         $this->helper->logInfo("doCreate: Now submitting order");
 
-        if (is_object($this->cartManagementInterface) && version_compare($this->helper->getMagentoVersion(), '2.1.0') >= 0) {
-            $this->cartRepositoryInterface->save($quote);
-            $quote = $this->cartRepositoryInterface->get($quote->getId());
-            $newOrder = $this->cartManagementInterface->submit($quote);
-        } else {
-            $newOrder = $this->quoteManagement->submit($quote);
+        // --- CRITICAL FIX: Wrap submission in try/catch to log Magento validation errors ---
+        $newOrder = null;
+        try {
+            if (is_object($this->cartManagementInterface) && version_compare($this->helper->getMagentoVersion(), '2.1.0') >= 0) {
+                $this->cartRepositoryInterface->save($quote);
+                $quote = $this->cartRepositoryInterface->get($quote->getId());
+                $newOrder = $this->cartManagementInterface->submit($quote);
+            } else {
+                $newOrder = $this->quoteManagement->submit($quote);
+            }
+        } catch (\Exception $e) {
+            $msg = $e->getMessage();
+            $this->helper->logError("Quote Submission Failed for Order {$orderId}: " . $msg);
+
+            $str .= "<Info><![CDATA[Magento rejected the order: $msg]]></Info>\n";
+            $str .= "<Exception><![CDATA[$msg]]></Exception>\n";
+            $str .= "<NotImported>$orderId</NotImported>\n";
+
+            // Delete history so ChannelUnity is allowed to retry it later
+            $this->deleteOrderImportHistory((string) $order->OrderId, (int) $dataArray->SubscriptionId);
+            return $str;
         }
 
         if (is_object($newOrder) && $newOrder->getEntityId()) {
@@ -548,7 +575,7 @@ class Orders extends AbstractModel
             $newOrder->setCreatedAt((string) $order->PurchaseDate);
             $newOrder->save();
         } else {
-            $str .= "<Info>It seems the order didn't create</Info>\n";
+            $str .= "<Info>It seems the order didn't create for an unknown reason.</Info>\n";
         }
 
         $this->deleteOrderImportHistory((string) $order->OrderId, (int) $dataArray->SubscriptionId);
@@ -582,22 +609,25 @@ class Orders extends AbstractModel
         return $invoice;
     }
 
-    private function createStubProduct($item, $productPrice)
+    private function createStubProduct($item, $productPrice, $websiteId)
     {
-        $websiteId = $this->storeManager->getWebsite()->getWebsiteId();
         $defaultAttributeSet = $this->product->getDefaultAttributeSetId();
 
         $product = $this->productFactory->create();
+
+        // Explicitly set the website ID matching the order's quote
         $product->setWebsiteIds([$websiteId]);
+
         $product->setSku((string)$item->SKU);
         $product->setName((string)$item->Name);
         $product->setDescription((string)$item->Name);
-        $product->setStatus(1);
+        $product->setStatus(1); // 1 = Enabled
         $product->setAttributeSetId($defaultAttributeSet);
-        $product->setVisibility(1);
+        $product->setVisibility(1); // 1 = Not Visible Individually (keeps it hidden from frontend)
         $product->setTaxClassId(0);
         $product->setTypeId('simple');
         $product->setPrice($productPrice);
+
         $product->setStockData([
             'use_config_manage_stock' => 0,
             'manage_stock' => 0,
@@ -605,8 +635,9 @@ class Orders extends AbstractModel
             'qty' => (int)$item->Quantity
         ]);
 
+        $product->setQuantityAndStockStatus(['is_in_stock' => 1, 'qty' => (int)$item->Quantity]);
         $newProduct = $this->productRepository->save($product);
-        return $this->productRepository->getById($newProduct->getId());
+        return $this->productRepository->getById($newProduct->getId(), false, null, true);
     }
 
     private function getFirstName(string $name): string
