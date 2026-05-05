@@ -16,6 +16,7 @@ use Magento\Framework\Api\SearchCriteriaBuilder;
 use Magento\Sales\Model\RefundOrder;
 use Magento\Sales\Model\Order\Creditmemo\ItemCreationFactory;
 use Magento\Sales\Api\Data\CreditmemoCreationArgumentsInterfaceFactory;
+use Camiloo\Channelunity\Helper\Data;
 
 class Refunds extends AbstractModel
 {
@@ -50,7 +51,7 @@ class Refunds extends AbstractModel
     private $creditMemoArgumentsFactory;
 
     public function __construct(
-        Helper $helper,
+        Data $helper,
         OrderRepositoryInterface $orderRepository,
         SearchCriteriaBuilder $searchCriteriaBuilder,
         RefundOrder $refundOrder,
